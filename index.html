@@ -1942,39 +1942,6 @@ function getSendProbability(lastChatTime) {
     return 2;
 }
 
-// ==================== AI 自动 @ 辅助函数 ====================
-
-/**
- * 在文本中插入 @ 提及
- * @param {string} text - 原始文本
- * @param {string} mentionName - 要 @ 的名字（如 "诗远"）
- * @param {string} position - 'front' | 'back' | 'middle'，默认随机
- * @returns {string} 插入后的文本
- */
-function insertMentionIntoText(text, mentionName, position) {
-    if (!text) return '@' + mentionName;
-    if (!mentionName) return text;
-    
-    var mentionText = '@' + mentionName;
-    var positions = ['front', 'back', 'middle'];
-    var pos = position || positions[Math.floor(Math.random() * positions.length)];
-    
-    if (pos === 'front') {
-        return mentionText + ' ' + text;
-    } else if (pos === 'back') {
-        return text + ' ' + mentionText;
-    } else {
-        // 中间：在随机位置插入
-        var words = text.split(' ');
-        if (words.length <= 1) {
-            return text + ' ' + mentionText;
-        }
-        var insertIdx = Math.floor(Math.random() * words.length);
-        words.splice(insertIdx, 0, mentionText);
-        return words.join(' ');
-    }
-}
-
 // 从公共词条库 + 私人词条库随机取 1-3 条组合
 function generateAutoMessage(friendId) {
     let allItems = [];
@@ -4129,8 +4096,8 @@ function runInitialReminderCheck() {
 }
 
 function loadData() {
-    // 返回 Promise 以便 init() 中使用 .then()
-    return loadDataFromDB().then(function(saved) {
+    // 从 IndexedDB 加载数据
+    loadDataFromDB().then(function(saved) {
         if (saved) {
             try {
                 // ===== 数据完整性校验 =====
@@ -4434,9 +4401,6 @@ if (appData.myNickname === undefined) {
         checkPendingQuestionnaires();
         applyGlobalTheme();
         
-        // 返回 appData 以便链式调用
-        return appData;
-        
     }).catch(function(err) {
         console.error('从 IndexedDB 加载失败:', err);
         alert('⚠️ 数据加载失败，将使用默认数据。\n\n错误信息: ' + err.message);
@@ -4446,7 +4410,6 @@ if (appData.myNickname === undefined) {
         startLetterCheckLoop();
         checkPendingQuestionnaires();
         applyGlobalTheme();
-        return appData;
     });
 }
 
@@ -4710,14 +4673,6 @@ appData.friendProfilePopupDate = {};
     appData.friendMomentRedDot = {};
     appData.friendLetterRedDot = {};
     appData.sessions = [];
-// 为群聊会话增加 unreadMentions 字段（数据迁移兼容）
-if (appData.sessions) {
-    for (var i = 0; i < appData.sessions.length; i++) {
-        if (appData.sessions[i].type === 'group') {
-            appData.sessions[i].unreadMentions = [];
-        }
-    }
-}
     saveData();
 }
 
@@ -9286,8 +9241,37 @@ function sendMessage(sessionId, text, fromSelf = true, senderInfo = null, isPat 
     let minutes = String(now.getMinutes()).padStart(2, '0');
     let seconds = String(now.getSeconds()).padStart(2, '0');
     let timeStr = `${year}/${month}/${day} ${hours}:${minutes}:${seconds}`;
-    let msgId = Date.now() + "_" + Math.random().toString(36).substr(2, 6);
-    let msg = {
+        let msgId = Date.now() + "_" + Math.random().toString(36).substr(2, 6);
+    let session = appData.sessions.find(s => s.sessionId === sessionId);
+    // ===== 解析 @ 提及 =====
+let mentions = [];
+if (session && session.type === 'group' && text) {
+    let group = appData.groups.find(function(g) { return g.id === session.targetId; });
+    if (group) {
+        let members = group.members.map(function(mid) {
+            let friend = appData.friends.find(function(f) { return f.id === mid; });
+            return friend ? { id: friend.id, name: friend.name } : null;
+        }).filter(function(m) { return m !== null; });
+        
+        // 检测 @所有人
+        if (text.indexOf('@所有人') !== -1) {
+            mentions.push({ id: 'all', name: '所有人' });
+        }
+        
+        // 检测 @成员
+        for (let i = 0; i < members.length; i++) {
+            let member = members[i];
+            if (text.indexOf('@' + member.name) !== -1) {
+                let exists = mentions.some(function(m) { return m.id === member.id; });
+                if (!exists) {
+                    mentions.push({ id: member.id, name: member.name });
+                }
+            }
+        }
+    }
+}
+
+let msg = {
     id: msgId,
     text: text,
     time: timeStr,
@@ -9296,111 +9280,8 @@ function sendMessage(sessionId, text, fromSelf = true, senderInfo = null, isPat 
     read: false,
     readByReceiver: false,
     isPat: isPat,
-    mentions: []  // 新增：存储被 @ 的用户 ID 列表
+    mentions: mentions
 };
-
-// ===== 群聊 @ 解析逻辑 =====
-if (session && session.type === 'group' && !isPat && !isVote && !isQuestionnaire) {
-    var group = appData.groups.find(function(g) { return g.id === session.targetId; });
-    if (group) {
-        // 获取群成员 ID 列表（排除自己）
-        var memberIds = group.members.filter(function(mid) { return mid !== 'self'; });
-        // 获取群成员名称映射
-        var memberNameMap = {};
-        for (var i = 0; i < group.members.length; i++) {
-            var mid = group.members[i];
-            if (mid === 'self') {
-                memberNameMap['self'] = appData.user.name;
-            } else {
-                var friend = appData.friends.find(function(f) { return f.id === mid; });
-                if (friend) {
-                    memberNameMap[mid] = friend.name;
-                }
-            }
-        }
-        // 反向映射：名称 -> ID（处理同名）
-        var nameToIdMap = {};
-        var nameCountMap = {};
-        for (var mid2 in memberNameMap) {
-            if (memberNameMap.hasOwnProperty(mid2)) {
-                var name = memberNameMap[mid2];
-                if (!nameCountMap[name]) nameCountMap[name] = 0;
-                nameCountMap[name]++;
-            }
-        }
-        for (var mid3 in memberNameMap) {
-            if (memberNameMap.hasOwnProperty(mid3)) {
-                var name3 = memberNameMap[mid3];
-                if (nameCountMap[name3] > 1) {
-                    // 同名：存储为 "名字 (ID)" 格式
-                    var friend3 = appData.friends.find(function(f) { return f.id === mid3; });
-                    var displayName = name3 + ' (' + (friend3 ? friend3.id : mid3) + ')';
-                    nameToIdMap[displayName] = mid3;
-                } else {
-                    nameToIdMap[name3] = mid3;
-                }
-            }
-        }
-        // 特殊处理：@所有人
-        nameToIdMap['所有人'] = 'everyone';
-
-        // 正则匹配 @名字（精准匹配，忽略首尾空格）
-        var mentionRegex = /@([^\s，,。、！？\n]+)/g;
-        var match;
-        var mentionedIds = [];
-        while ((match = mentionRegex.exec(text)) !== null) {
-            var matchedName = match[1].trim();
-            // 检查是否匹配到成员
-            if (matchedName === '所有人') {
-                // @所有人：添加所有成员 ID
-                for (var mi = 0; mi < memberIds.length; mi++) {
-                    if (mentionedIds.indexOf(memberIds[mi]) === -1) {
-                        mentionedIds.push(memberIds[mi]);
-                    }
-                }
-                // 也添加自己（用于显示高亮）
-                if (mentionedIds.indexOf('self') === -1) {
-                    mentionedIds.push('self');
-                }
-            } else {
-                // 精准匹配
-                var matchedId = null;
-                // 先尝试直接匹配
-                if (nameToIdMap[matchedName]) {
-                    matchedId = nameToIdMap[matchedName];
-                } else {
-                    // 尝试匹配带 ID 后缀的格式（同名情况）
-                    for (var key in nameToIdMap) {
-                        if (nameToIdMap.hasOwnProperty(key) && key.indexOf(matchedName) === 0) {
-                            matchedId = nameToIdMap[key];
-                            break;
-                        }
-                    }
-                }
-                if (matchedId && matchedId !== 'everyone') {
-                    if (mentionedIds.indexOf(matchedId) === -1) {
-                        mentionedIds.push(matchedId);
-                    }
-                }
-            }
-        }
-        msg.mentions = mentionedIds;
-
-        // 如果是群聊且不是自己发的，且提到了自己，更新会话的 unreadMentions
-        if (!fromSelf && mentionedIds.indexOf('self') !== -1) {
-            var sessionObj = appData.sessions.find(function(s) { return s.sessionId === sessionId; });
-            if (sessionObj) {
-                if (!sessionObj.unreadMentions) sessionObj.unreadMentions = [];
-                if (sessionObj.unreadMentions.indexOf('self') === -1) {
-                    sessionObj.unreadMentions.push('self');
-                }
-                // 如果有多个 @，存发送者 ID 用于显示
-                if (!sessionObj._mentionSenders) sessionObj._mentionSenders = {};
-                sessionObj._mentionSenders[msgId] = fromSelf ? 'self' : (senderInfo ? senderInfo.id : 'other');
-            }
-        }
-    }
-}
     if (isVote && voteData) {
         msg.isVote = true;
         msg.voteId = voteData.id;
@@ -9409,7 +9290,7 @@ if (session && session.type === 'group' && !isPat && !isVote && !isQuestionnaire
     if (isQuestionnaire && questionnaireId) {
     msg.isQuestionnaire = true;
     msg.questionnaireId = questionnaireId;
-    msg.fromMe = fromSelf;  // ← 只加了这一行
+    msg.fromMe = fromSelf;
 }
     if (senderInfo) {
         msg.senderName = senderInfo.name;
@@ -9417,7 +9298,6 @@ if (session && session.type === 'group' && !isPat && !isVote && !isQuestionnaire
         msg.senderId = senderInfo.id;
     }
     if (replyTo) {
-    // 如果是引用图片，确保图片数据完整传递
     msg.replyTo = {
         msgId: replyTo.msgId,
         senderName: replyTo.senderName,
@@ -9430,7 +9310,6 @@ if (session && session.type === 'group' && !isPat && !isVote && !isQuestionnaire
         appData.messages[sessionId] = [];
     }
     appData.messages[sessionId].push(msg);
-    let session = appData.sessions.find(s => s.sessionId === sessionId);
     if (session) {
         if (isVote) {
             session.lastMsg = `投票：${voteData.title}`;
@@ -9807,19 +9686,19 @@ function scheduleConsecutiveReplies(sessionId, friendId, remainingCount) {
         let doPat = Math.random() * 100 < friendPatProb;
         
         if (doPat) {
-    sendPatMessage(sessionId, false);
-} else {
-    let doQuote = Math.random() * 100 < (appData.chatSettings.replyWithQuoteProb || 40);
-    let replyText = getRandomAutoReplyForFriend(friendId);
-    let replyTo = null;
-    if (doQuote) {
-        let quoteMsg = getRandomHistoricalMessageForQuote(sessionId);
-        if (quoteMsg) {
-            replyTo = quoteMsg;
-        }
-    }
-    
-    // ★★★ 新增：触发"添加字卡"请求（概率调整为 1%，更明显） ★★★
+            sendPatMessage(sessionId, false);
+        } else {
+            let doQuote = Math.random() * 100 < (appData.chatSettings.replyWithQuoteProb || 40);
+            let replyText = getRandomAutoReplyForFriend(friendId);
+            let replyTo = null;
+            if (doQuote) {
+                let quoteMsg = getRandomHistoricalMessageForQuote(sessionId);
+                if (quoteMsg) {
+                    replyTo = quoteMsg;
+                }
+            }
+            
+            // ★★★ 新增：触发"添加字卡"请求（概率调整为 1%，更明显） ★★★
 if (Math.random() < 0.01) {
     let myMessages = (appData.messages[sessionId] || []).filter(m => m.from === "self" && m.text && !m.text.startsWith("data:image"));
     let lastMyMsg = myMessages.length > 0 ? myMessages[myMessages.length - 1] : null;
@@ -9846,34 +9725,9 @@ if (Math.random() < 0.01) {
     }
 }
 // ★★★ 新增结束 ★★★
-
-    // ===== 群聊 @ 逻辑：检查是否有 @ 了当前好友的消息，40% 概率回复时 @ 回去 =====
-    var session = appData.sessions.find(function(s) { return s.sessionId === sessionId; });
-    var shouldMentionBack = false;
-    if (session && session.type === 'group') {
-        // 检查最近的消息中是否有 @ 了当前好友
-        var recentMsgs = appData.messages[sessionId] || [];
-        for (var i = recentMsgs.length - 1; i >= 0 && i >= recentMsgs.length - 20; i--) {
-            var m = recentMsgs[i];
-            if (m.from !== 'self' && m.mentions && m.mentions.indexOf(friendId) !== -1) {
-                // 有人 @ 了当前好友
-                if (Math.random() * 100 < 40) {
-                    shouldMentionBack = true;
-                }
-                break;
-            }
+            
+            sendMessage(sessionId, replyText, false, null, false, false, null, replyTo);
         }
-    }
-
-    var finalText = replyText;
-    if (shouldMentionBack && session && session.type === 'group') {
-        var senderName = appData.user.name;
-        // 在消息后插入 @当前用户
-        finalText = replyText + ' @' + senderName;
-    }
-
-    sendMessage(sessionId, finalText, false, null, false, false, null, replyTo);
-}
         
         if (remainingCount - 1 > 0) {
             scheduleConsecutiveReplies(sessionId, friendId, remainingCount - 1);
@@ -9927,83 +9781,80 @@ function scheduleGroupConsecutiveReplies(sessionId, members, index, isFirstRound
     let memberDoPat = Math.random() * 100 < memberPatProb;
     
     let timer = setTimeout(() => {
-        if (memberDoPat) {
-    sendPatMessageWithSender(sessionId, false, memberInfo);
-} else {
-    let doQuote = Math.random() * 100 < (appData.chatSettings.replyWithQuoteProb || 40);
-    let replyText = getRandomAutoReplyForFriend(member.id);
-    let replyTo = null;
-    if (doQuote) {
-        let quoteMsg = getRandomHistoricalMessageForQuote(sessionId);
-        if (quoteMsg) {
-            replyTo = quoteMsg;
+    if (memberDoPat) {
+        sendPatMessageWithSender(sessionId, false, memberInfo);
+    } else {
+        let doQuote = Math.random() * 100 < (appData.chatSettings.replyWithQuoteProb || 40);
+        let replyText = getRandomAutoReplyForFriend(member.id);
+        let replyTo = null;
+        if (doQuote) {
+            let quoteMsg = getRandomHistoricalMessageForQuote(sessionId);
+            if (quoteMsg) {
+                replyTo = quoteMsg;
+            }
         }
+        
+        // ===== AI 群成员概率触发 @ =====
+        let finalText = replyText;
+        let group = appData.groups.find(function(g) { return g.id === session.targetId; });
+        if (group) {
+            // 获取群成员列表（排除自己）
+            let otherMembers = group.members.filter(function(mid) { return mid !== 'self'; });
+            if (otherMembers.length > 0) {
+                // 1. 2% 概率主动 @ 我
+                if (Math.random() < 0.02) {
+                    let self = appData.friends.find(function(f) { return f.id === 'self'; });
+                    if (self) {
+                        let atText = '@' + self.name + ' ';
+                        if (Math.random() < 0.5) {
+                            finalText = atText + finalText;
+                        } else {
+                            finalText = finalText + atText;
+                        }
+                    }
+                }
+                
+                // 2. 1% 概率随机 @ 其他群成员（不是我）
+                if (Math.random() < 0.01) {
+                    let availableMembers = otherMembers.filter(function(mid) { return mid !== memberInfo.id; });
+                    if (availableMembers.length > 0) {
+                        let randomMid = availableMembers[Math.floor(Math.random() * availableMembers.length)];
+                        let randomMember = appData.friends.find(function(f) { return f.id === randomMid; });
+                        if (randomMember) {
+                            let atText = '@' + randomMember.name + ' ';
+                            if (Math.random() < 0.5) {
+                                finalText = atText + finalText;
+                            } else {
+                                finalText = finalText + atText;
+                            }
+                        }
+                    }
+                }
+                
+                // 3. 0.1% 起哄 @ 我（非被@成员发消息时）
+                if (Math.random() < 0.001) {
+                    let self = appData.friends.find(function(f) { return f.id === 'self'; });
+                    if (self) {
+                        let atText = '@' + self.name + ' ';
+                        if (Math.random() < 0.5) {
+                            finalText = atText + finalText;
+                        } else {
+                            finalText = finalText + atText;
+                        }
+                    }
+                }
+            }
+        }
+        
+        sendMessage(sessionId, finalText, false, {
+            id: memberInfo.id,
+            name: memberInfo.name,
+            avatar: memberInfo.avatar
+        }, false, false, null, replyTo);
     }
     
-    // ===== 群聊 @ 逻辑：AI 群成员发消息时自动 @ =====
-    var finalText = replyText;
-    var session = appData.sessions.find(function(s) { return s.sessionId === sessionId; });
-    var group = null;
-    if (session && session.type === 'group') {
-        group = appData.groups.find(function(g) { return g.id === session.targetId; });
-    }
-    if (group) {
-        // 获取群成员列表（排除自己）
-        var otherMembers = group.members.filter(function(mid) { return mid !== 'self' && mid !== memberInfo.id; });
-        
-        // 1. 2% 概率 @ 你（当前用户）
-        if (Math.random() * 100 < 2) {
-            var selfName = appData.user.name;
-            // 随机选择插入位置：前面(50%) 或 后面(50%)
-            if (Math.random() < 0.5) {
-                finalText = '@' + selfName + ' ' + finalText;
-            } else {
-                finalText = finalText + ' @' + selfName;
-            }
-        }
-        // 2. 1% 概率 @ 其他群成员（不是你）
-        else if (otherMembers.length > 0 && Math.random() * 100 < 1) {
-            // 随机选一个其他成员
-            var randomIdx = Math.floor(Math.random() * otherMembers.length);
-            var targetId = otherMembers[randomIdx];
-            var targetName = '成员';
-            if (targetId === 'self') {
-                targetName = appData.user.name;
-            } else {
-                var targetFriend = appData.friends.find(function(f) { return f.id === targetId; });
-                if (targetFriend) targetName = targetFriend.name;
-            }
-            // 随机选择插入位置：前面(50%) 或 后面(50%)
-            if (Math.random() < 0.5) {
-                finalText = '@' + targetName + ' ' + finalText;
-            } else {
-                finalText = finalText + ' @' + targetName;
-            }
-        }
-        // 3. 起哄 @（0.1%）：非被@成员在发消息时，有 0.1% 概率额外插入 @ 你
-        if (Math.random() * 100 < 0.01) {
-            var selfName2 = appData.user.name;
-            // 在消息中间随机位置插入 @诗远
-            var words = finalText.split(' ');
-            if (words.length > 1) {
-                var insertIdx = Math.floor(Math.random() * words.length);
-                words.splice(insertIdx, 0, '@' + selfName2);
-                finalText = words.join(' ');
-            } else {
-                finalText = finalText + ' @' + selfName2;
-            }
-        }
-    }
-    
-    sendMessage(sessionId, finalText, false, {
-        id: memberInfo.id,
-        name: memberInfo.name,
-        avatar: memberInfo.avatar
-    }, false, false, null, replyTo);
-}
-        
-        scheduleGroupConsecutiveReplies(sessionId, members, index + 1, isFirstRound);
-    }, consecutiveDelay);
+    scheduleGroupConsecutiveReplies(sessionId, members, index + 1, isFirstRound);
+}, consecutiveDelay);
     
     if (!consecutiveReplyQueues[sessionId]) {
         consecutiveReplyQueues[sessionId] = {};
@@ -14426,124 +14277,46 @@ if (!isMine && session.type === 'group' && m.senderId) {
 } else if (m.text && m.text.startsWith('data:image')) {
     contentHtml = '<img src="' + m.text + '" style="max-width:60px; max-height:60px; border-radius:8px; cursor:pointer;" onclick="showImageViewer(\'' + m.text.replace(/'/g, "\\'") + '\')">';
 } else {
-    // ===== 群聊 @ 高亮渲染 =====
-    var rawText = m.text || '';
-    var isGroup = (session && session.type === 'group');
-    var mentionedIds = m.mentions || [];
-    var isMentionedSelf = mentionedIds.indexOf('self') !== -1;
+    // ===== 渲染 @ 高亮 =====
+    var textContent = m.text || '';
+    var mentions = m.mentions || [];
+    var currentUserId = 'self';
     
-    if (isGroup && mentionedIds.length > 0) {
-        // 构建成员名称映射（用于显示高亮）
-        var group = appData.groups.find(function(g) { return g.id === session.targetId; });
-        var memberNameMap = {};
-        if (group) {
-            for (var i = 0; i < group.members.length; i++) {
-                var mid = group.members[i];
-                if (mid === 'self') {
-                    memberNameMap['self'] = appData.user.name;
-                } else {
-                    var friend = appData.friends.find(function(f) { return f.id === mid; });
-                    if (friend) {
-                        memberNameMap[mid] = friend.name;
-                    }
-                }
-            }
-        }
+    if (mentions.length > 0) {
+        // 按名字长度降序排序，先替换长的名字，避免短名字被误匹配
+        var sortedMentions = mentions.slice().sort(function(a, b) {
+            return b.name.length - a.name.length;
+        });
         
-        // 构建 @名称 到 ID 的映射（用于替换高亮）
-        var nameToIdMap = {};
-        var nameCountMap = {};
-        for (var mid2 in memberNameMap) {
-            if (memberNameMap.hasOwnProperty(mid2)) {
-                var name2 = memberNameMap[mid2];
-                if (!nameCountMap[name2]) nameCountMap[name2] = 0;
-                nameCountMap[name2]++;
-            }
-        }
-        for (var mid3 in memberNameMap) {
-            if (memberNameMap.hasOwnProperty(mid3)) {
-                var name3 = memberNameMap[mid3];
-                if (nameCountMap[name3] > 1) {
-                    var friend3 = appData.friends.find(function(f) { return f.id === mid3; });
-                    nameToIdMap[name3 + ' (' + (friend3 ? friend3.id : mid3) + ')'] = mid3;
-                } else {
-                    nameToIdMap[name3] = mid3;
-                }
-            }
-        }
-        nameToIdMap['所有人'] = 'everyone';
-        
-        // 反转映射：ID -> 名称
-        var idToNameMap = {};
-        for (var key in nameToIdMap) {
-            if (nameToIdMap.hasOwnProperty(key)) {
-                idToNameMap[nameToIdMap[key]] = key;
-            }
-        }
-        
-        // 替换 @名称 为高亮 HTML
-        var mentionRegex = /@([^\s，,。、！？\n]+)/g;
-        var parts = [];
-        var lastIndex = 0;
-        var match;
-        var tempText = rawText;
-        // 先收集所有 @ 匹配
-        var matches = [];
-        while ((match = mentionRegex.exec(rawText)) !== null) {
-            matches.push({
-                index: match.index,
-                endIndex: match.index + match[0].length,
-                fullMatch: match[0],
-                name: match[1].trim()
-            });
-        }
-        
-        if (matches.length > 0) {
-            var currentPos = 0;
-            for (var mi = 0; mi < matches.length; mi++) {
-                var m = matches[mi];
-                // 添加 @ 之前的普通文本
-                if (m.index > currentPos) {
-                    parts.push(escapeHtml(rawText.substring(currentPos, m.index)));
-                }
-                // 检查这个 @ 名称对应的 ID
-                var matchedName = m.name;
-                var matchedId = null;
-                // 精准匹配
-                if (nameToIdMap[matchedName]) {
-                    matchedId = nameToIdMap[matchedName];
-                } else {
-                    // 尝试匹配带 ID 后缀的格式
-                    for (var key2 in nameToIdMap) {
-                        if (nameToIdMap.hasOwnProperty(key2) && key2.indexOf(matchedName) === 0) {
-                            matchedId = nameToIdMap[key2];
-                            break;
-                        }
-                    }
-                }
-                // 判断高亮颜色
-                var highlightColor = '#007aff'; // 蓝色（你 @ 别人 / 别人 @ 别人）
-                if (matchedId === 'self' || matchedName === appData.user.name) {
-                    highlightColor = '#ff9500'; // 橙色（别人 @ 你）
-                }
-                if (matchedName === '所有人') {
-                    highlightColor = '#ff9500'; // @所有人 橙色
-                }
-                // 渲染高亮 @
-                parts.push('<span style="color:' + highlightColor + ';font-weight:600;">' + escapeHtml(m.fullMatch) + '</span>');
-                currentPos = m.endIndex;
-            }
-            // 添加剩余文本
-            if (currentPos < rawText.length) {
-                parts.push(escapeHtml(rawText.substring(currentPos)));
-            }
-            contentHtml = parts.join('');
-        } else {
-            contentHtml = escapeHtml(rawText);
+        for (var i = 0; i < sortedMentions.length; i++) {
+            var mention = sortedMentions[i];
+            var isAll = (mention.id === 'all');
+            var isMe = (mention.id === currentUserId);
+            var color = isAll ? '#ff9500' : (isMe ? '#ff9500' : '#007aff');
+            var displayName = mention.name;
+            var escapedName = mention.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            var regex = new RegExp('@' + escapedName + '(?![\\w\\u4e00-\\u9fa5])', 'g');
+            textContent = textContent.replace(regex, '<span style="color:' + color + ';font-weight:600;">@' + displayName + '</span>');
         }
     } else {
-        contentHtml = escapeHtml(m.text || '');
+        // 没有 mentions 时，用正则简单匹配 @名字 并高亮
+        var mentionRegex = /@([^\s，。！？、；：""''（）\s]+)/g;
+        textContent = textContent.replace(mentionRegex, function(match, name) {
+            // 检查是否是 @所有人
+            if (name === '所有人') {
+                return '<span style="color:#ff9500;font-weight:600;">@所有人</span>';
+            }
+            // 检查是否是当前用户
+            var isMe = false;
+            var friend = appData.friends.find(function(f) { return f.name === name; });
+            if (friend && friend.id === 'self') {
+                isMe = true;
+            }
+            var color = isMe ? '#ff9500' : '#007aff';
+            return '<span style="color:' + color + ';font-weight:600;">@' + name + '</span>';
+        });
     }
+    contentHtml = textContent;
 }
     
     var readMark = '';
@@ -14638,13 +14411,75 @@ if (bubble) {
     
     // 头像点击
     var avatarEl = wrapper.querySelector('.msg-avatar');
-    if (avatarEl && session.type === 'friend') {
+if (avatarEl && session.type === 'friend') {
+    avatarEl.style.cursor = 'pointer';
+    avatarEl.addEventListener('click', function(e) {
+        e.stopPropagation();
+        showFriendProfile(session.targetId);
+    });
+}
+if (avatarEl && session.type === 'group') {
+    // ===== 优先从消息中获取 senderName，其次用 senderId 查找 =====
+    var memberName = m.senderName || '';
+    var memberId = m.senderId || wrapper.getAttribute('data-msg-from') || '';
+    
+    // 如果 senderName 为空，尝试从 friends 中查找
+    if (!memberName && memberId) {
+        var member = appData.friends.find(function(f) { return f.id === memberId; });
+        if (member) {
+            memberName = member.name;
+        }
+    }
+    
+    // 如果还是找不到，用 session.name 或默认值
+    if (!memberName) {
+        memberName = session.name || '群成员';
+    }
+    
+    if (memberId && memberId !== 'self' && memberId !== 'system') {
         avatarEl.style.cursor = 'pointer';
-        avatarEl.addEventListener('click', function(e) {
-            e.stopPropagation();
-            showFriendProfile(session.targetId);
+        var pressTimer = null;
+        avatarEl.addEventListener('touchstart', function(e) {
+            pressTimer = setTimeout(function() {
+                var input = currentOpenChatWindow ? currentOpenChatWindow.querySelector('#msgInput') : null;
+                if (input) {
+                    var currentText = input.value;
+                    var atText = '@' + memberName + ' ';
+                    input.value = currentText + atText;
+                    input.focus();
+                    var event = new Event('input', { bubbles: true });
+                    input.dispatchEvent(event);
+                }
+            }, 500);
+        });
+        avatarEl.addEventListener('touchend', function() {
+            if (pressTimer) clearTimeout(pressTimer);
+        });
+        avatarEl.addEventListener('touchmove', function() {
+            if (pressTimer) clearTimeout(pressTimer);
+        });
+        // PC 端鼠标长按
+        avatarEl.addEventListener('mousedown', function(e) {
+            pressTimer = setTimeout(function() {
+                var input = currentOpenChatWindow ? currentOpenChatWindow.querySelector('#msgInput') : null;
+                if (input) {
+                    var currentText = input.value;
+                    var atText = '@' + memberName + ' ';
+                    input.value = currentText + atText;
+                    input.focus();
+                    var event = new Event('input', { bubbles: true });
+                    input.dispatchEvent(event);
+                }
+            }, 500);
+        });
+        avatarEl.addEventListener('mouseup', function() {
+            if (pressTimer) clearTimeout(pressTimer);
+        });
+        avatarEl.addEventListener('mouseleave', function() {
+            if (pressTimer) clearTimeout(pressTimer);
         });
     }
+}
     
 // 问卷卡片点击
 var card = wrapper.querySelector('.bubble[data-qid]');
@@ -14670,74 +14505,24 @@ if (card) {
         });
     }
     
-    // 引用预览点击跳转（增强版 - 支持重新渲染定位）
-var replyPreview = wrapper.querySelector('.reply-preview');
-if (replyPreview) {
-    replyPreview.addEventListener('click', function(e) {
-        e.stopPropagation();
-        var targetMsgId = this.getAttribute('data-reply-msg-id');
-        if (!targetMsgId) {
-            alert('无法定位原消息');
-            return;
-        }
-        
-        var container = chatWin.querySelector('.messages-container');
-        if (!container) return;
-        
-        // 方法1：直接通过 data-msg-id 查找
-        var targetWrapper = container.querySelector('.virtual-message-item[data-msg-id="' + targetMsgId + '"]');
-        
-        if (targetWrapper) {
-            targetWrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            targetWrapper.classList.add('highlight-message');
-            setTimeout(function() {
-                targetWrapper.classList.remove('highlight-message');
-            }, 2500);
-            return;
-        }
-        
-        // 方法2：通过气泡的 data-msg-id 查找
-        var allWrappers = container.querySelectorAll('.virtual-message-item');
-        for (var j = 0; j < allWrappers.length; j++) {
-            var wrapperEl = allWrappers[j];
-            var bubble = wrapperEl.querySelector('.bubble');
-            if (bubble && bubble.getAttribute('data-msg-id') === targetMsgId) {
-                wrapperEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                wrapperEl.classList.add('highlight-message');
+    // 回复预览点击跳转
+    var replyPreview = wrapper.querySelector('.reply-preview');
+    if (replyPreview) {
+        replyPreview.addEventListener('click', function(e) {
+            var targetMsgId = replyPreview.getAttribute('data-reply-msg-id');
+            var container = chatWin.querySelector('.messages-container');
+            var targetWrapper = container.querySelector('.virtual-message-item[data-msg-id="' + targetMsgId + '"]');
+            if (targetWrapper) {
+                targetWrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                targetWrapper.classList.add('highlight-message');
                 setTimeout(function() {
-                    wrapperEl.classList.remove('highlight-message');
-                }, 2500);
-                return;
+                    targetWrapper.classList.remove('highlight-message');
+                }, 2000);
+            } else {
+                alert('原消息可能已被清除');
             }
-        }
-        
-        // 方法3：重新渲染并定位
-        var msgs = appData.messages[session.sessionId] || [];
-        var found = false;
-        for (var k = 0; k < msgs.length; k++) {
-            if (msgs[k].id === targetMsgId) {
-                found = true;
-                break;
-            }
-        }
-        
-        if (found) {
-            renderChatMessagesToWindow(chatWin, session.sessionId);
-            setTimeout(function() {
-                var retryWrapper = container.querySelector('.virtual-message-item[data-msg-id="' + targetMsgId + '"]');
-                if (retryWrapper) {
-                    retryWrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    retryWrapper.classList.add('highlight-message');
-                    setTimeout(function() {
-                        retryWrapper.classList.remove('highlight-message');
-                    }, 2500);
-                }
-            }, 300);
-        } else {
-            alert('原消息可能已被清除');
-        }
-    });
-}
+        });
+    }
     
     return wrapper;
 }
@@ -15258,7 +15043,6 @@ function openChatSession(session) {
     }
     let msgs = appData.messages[session.sessionId];
 let unreadChanged = false;
-let mentionCleared = false;
 for (let i = 0; i < msgs.length; i++) {
     if (msgs[i].from !== "self" && !msgs[i].read) {
         msgs[i].read = true;
@@ -15275,41 +15059,12 @@ if (unreadChanged) {
             if (badge) {
                 badge.remove();
             }
-        }
-    }
-}
-
-// ===== 群聊 @ 标记已读：进入群聊时清除针对自己的 @ 未读 =====
-if (session.type === 'group' && session.unreadMentions) {
-    if (session.unreadMentions.indexOf('self') !== -1) {
-        session.unreadMentions = session.unreadMentions.filter(function(id) {
-            return id !== 'self';
-        });
-        mentionCleared = true;
-    }
-    // 同时清除 _mentionSenders 中已读的消息
-    if (session._mentionSenders) {
-        var newMentionSenders = {};
-        // 只保留未读消息的 @ 记录
-        var unreadMsgIds = new Set();
-        for (var i = 0; i < msgs.length; i++) {
-            if (msgs[i].from !== 'self' && !msgs[i].read) {
-                unreadMsgIds.add(msgs[i].id);
+            // ===== 清除 @ 提醒 =====
+            let mentionReminder = sessionItem.querySelector('.session-name span:last-child');
+            if (mentionReminder && mentionReminder.textContent && mentionReminder.textContent.includes('@了我')) {
+                mentionReminder.remove();
             }
-        }
-        for (var msgId in session._mentionSenders) {
-            if (session._mentionSenders.hasOwnProperty(msgId)) {
-                if (unreadMsgIds.has(msgId)) {
-                    newMentionSenders[msgId] = session._mentionSenders[msgId];
-                }
-            }
-        }
-        session._mentionSenders = newMentionSenders;
-    }
-    if (mentionCleared) {
-        saveData();
-        // 刷新消息列表，移除红字提示
-        if (currentPage === "messages") {
+            // 或者直接重新渲染消息列表
             renderMessagesPage();
         }
     }
@@ -16984,69 +16739,16 @@ function renderMessagesPage() {
         return;
     }
     let html = "";
-for (let s of appData.sessions) {
-    let unreadHtml = "";
-    if (s.unread && s.unread > 0) {
-        unreadHtml = `<span class="unread-badge">${s.unread}</span>`;
-    }
-    
-    // ===== 群聊 @ 红字提示 =====
-    let mentionRedHtml = "";
-    if (s.type === 'group' && s.unreadMentions && s.unreadMentions.indexOf('self') !== -1) {
-        // 获取 @ 了当前用户的发送者名称列表
-        var mentionSenderNames = [];
-        var msgs = appData.messages[s.sessionId] || [];
-        // 从消息中找出提到了自己且未读的消息
-        var mentionMsgIds = new Set();
-        for (var i = 0; i < msgs.length; i++) {
-            var m = msgs[i];
-            if (m.from !== 'self' && m.mentions && m.mentions.indexOf('self') !== -1 && !m.read) {
-                var senderName = m.senderName || '未知';
-                if (mentionSenderNames.indexOf(senderName) === -1) {
-                    mentionSenderNames.push(senderName);
-                }
-                mentionMsgIds.add(m.id);
-            }
+    for (let s of appData.sessions) {
+        let unreadHtml = "";
+        if (s.unread && s.unread > 0) {
+            unreadHtml = `<span class="unread-badge">${s.unread}</span>`;
         }
-        // 如果从消息中没找到，从 _mentionSenders 中读取
-        if (mentionSenderNames.length === 0 && s._mentionSenders) {
-            for (var msgId in s._mentionSenders) {
-                if (s._mentionSenders.hasOwnProperty(msgId)) {
-                    var senderId = s._mentionSenders[msgId];
-                    var senderName = '未知';
-                    if (senderId === 'self') {
-                        senderName = '我';
-                    } else {
-                        var friend = appData.friends.find(function(f) { return f.id === senderId; });
-                        if (friend) senderName = friend.name;
-                    }
-                    if (mentionSenderNames.indexOf(senderName) === -1) {
-                        mentionSenderNames.push(senderName);
-                    }
-                }
-            }
+        let membersHtml = "";
+        if (s.membersCount) {
+            membersHtml = ` (${s.membersCount}人)`;
         }
-        // 去重并限制显示数量
-        var uniqueNames = [];
-        for (var i = 0; i < mentionSenderNames.length; i++) {
-            if (uniqueNames.indexOf(mentionSenderNames[i]) === -1) {
-                uniqueNames.push(mentionSenderNames[i]);
-            }
-        }
-        if (uniqueNames.length > 0) {
-            var displayText = uniqueNames.join('、');
-            if (uniqueNames.length > 2) {
-                displayText = uniqueNames.slice(0, 2).join('、') + '等';
-            }
-            mentionRedHtml = `<span style="color:#ff3b30;font-weight:600;font-size:12px;margin-left:6px;">[${escapeHtml(displayText)}@了我]</span>`;
-        }
-    }
-    
-    let membersHtml = "";
-    if (s.membersCount) {
-        membersHtml = ` (${s.membersCount}人)`;
-    }
-    // ===== 应用头像框到会话列表 =====
+        // ===== 应用头像框到会话列表 =====
 let frameId = 'frame_default';
 if (s.type === 'friend') {
     frameId = getSessionAvatarFrame(s.sessionId, 'other');
@@ -17056,7 +16758,7 @@ if (s.type === 'friend') {
 // 验证 frameId 是否有效
 if (frameId && frameId !== 'frame_default') {
     let frames = getAvatarFrameList();
-    let exists = frames.some(fr => fr.id === frameId);
+    let exists = frames.some(f => f.id === frameId);
     if (!exists) {
         frameId = getDefaultAvatarFrame();
     }
@@ -17064,11 +16766,50 @@ if (frameId && frameId !== 'frame_default') {
     frameId = getDefaultAvatarFrame();
 }
 let avatarHtml = renderAvatarWithFrame(s.avatar, frameId, 48);
+
+        // ===== 检查群聊 @ 提醒 =====
+        let mentionReminder = '';
+        if (s.type === 'group') {
+            let msgs = appData.messages[s.sessionId] || [];
+            let myMentions = [];
+            for (var mi = 0; mi < msgs.length; mi++) {
+                var msg = msgs[mi];
+                if (msg.from === 'self') continue;
+                if (msg.mentions && msg.mentions.length > 0) {
+                    for (var mj = 0; mj < msg.mentions.length; mj++) {
+                        var mention = msg.mentions[mj];
+                        if (mention.id === 'self' || mention.id === 'all') {
+                            var senderName = msg.senderName || '成员';
+                            if (myMentions.indexOf(senderName) === -1) {
+                                myMentions.push(senderName);
+                            }
+                        }
+                    }
+                } else if (msg.text) {
+                    // 没有 mentions 时，用正则检查
+                    var regex = /@(?:所有人|诗远)/g;
+                    var match;
+                    while ((match = regex.exec(msg.text)) !== null) {
+                        var matchedName = match[1] || match[0].replace('@', '');
+                        if (matchedName === '所有人' || matchedName === '诗远') {
+                            var senderName2 = msg.senderName || '成员';
+                            if (myMentions.indexOf(senderName2) === -1) {
+                                myMentions.push(senderName2);
+                            }
+                        }
+                    }
+                }
+            }
+            if (myMentions.length > 0) {
+                mentionReminder = '<span style="color:#ff3b30;font-size:12px;margin-left:4px;">[' + myMentions.join('、') + '@了我]</span>';
+            }
+        }
+
         html += `
             <div class="session-item" data-session-id="${s.sessionId}">
                 <div class="avatar">${avatarHtml}</div>
                 <div class="session-info">
-                    <div class="session-name"><span>${escapeHtml(s.name)}${membersHtml}</span>${unreadHtml}${mentionRedHtml}</div>
+                    <div class="session-name"><span>${escapeHtml(s.name)}${membersHtml}</span>${unreadHtml}${mentionReminder}</div>
                     <div class="last-msg">${escapeHtml(s.lastMsg)}</div>
                 </div>
                 <div class="time">${s.lastTime}</div>
@@ -19007,45 +18748,29 @@ function init() {
         saveData();
     } catch(e) {}
 
-    // ===== 修复：确保页面先渲染，再加载数据 =====
-    // 先绑定 Tab 事件，让页面可点击
+    loadData();
     let tabs = document.querySelectorAll(".tab-item");
     for (let tab of tabs) {
-        tab.addEventListener("click", function() {
-            let page = this.dataset.page;
+        tab.addEventListener("click", () => {
+            let page = tab.dataset.page;
             currentPage = page;
             for (let t of document.querySelectorAll(".tab-item")) {
                 t.classList.remove("active");
             }
-            this.classList.add("active");
+            tab.classList.add("active");
             for (let p of document.querySelectorAll(".page")) {
                 p.classList.remove("active");
             }
-            let targetPage = document.getElementById("page-" + page);
+            let targetPage = document.getElementById(`page-${page}`);
             if (targetPage) {
                 targetPage.classList.add("active");
             }
             renderCurrentPage();
         });
     }
-    
-    // 设置默认页面
-    currentPage = "messages";
-    let messagesPage = document.getElementById("page-messages");
-    if (messagesPage) {
-        messagesPage.classList.add("active");
-    }
-    
-    // 先渲染基础页面（显示加载状态）
-    let container = document.getElementById("sessionList");
-    if (container) {
-        container.innerHTML = "<div style='padding:20px;text-align:center;font-size:13px;color:#8e8e93;'>加载中...</div>";
-    }
-    
-    // 绑定其他事件
     let myProfileBtn = document.getElementById("myProfileBtn");
     if (myProfileBtn) {
-        myProfileBtn.addEventListener("click", function() {
+        myProfileBtn.addEventListener("click", () => {
             let profileTab = document.querySelector(".tab-item[data-page='profile']");
             if (profileTab) {
                 profileTab.click();
@@ -19054,38 +18779,36 @@ function init() {
     }
     let addBtn = document.getElementById("addBtn");
     if (addBtn) {
-        addBtn.addEventListener("click", function() {
+        addBtn.addEventListener("click", () => {
             alert("增加联系人或群聊: 请到联系人页面操作 ➕");
         });
     }
+    currentPage = "messages";
+    let messagesPage = document.getElementById("page-messages");
+    if (messagesPage) {
+        messagesPage.classList.add("active");
+    }
+    renderCurrentPage();
     
-    // 然后加载数据
-    loadData().then(function() {
-        // 数据加载完成后渲染页面
-        renderCurrentPage();
-        attachDynamicEvents();
-        
-        // ===== 启动自检测和自动清理 =====
-        setTimeout(function() {
-            autoCleanOldMessages();
-            performPerformanceCheck();
-        }, 3000);
-        
-        setInterval(function() {
-            performPerformanceCheck();
-        }, 30 * 60 * 1000);
-        
-        setInterval(function() {
-            autoCleanOldMessages();
-        }, 60 * 60 * 1000);
-        
-        startDiaryTimers();
-    }).catch(function(err) {
-        console.error("数据加载失败:", err);
-        // 即使加载失败，也显示一个空界面，让用户可以操作
-        renderCurrentPage();
-        attachDynamicEvents();
-    });
+    // ===== 🆕 新增：启动自检测和自动清理 =====
+    // 启动时延迟3秒执行，等页面加载完成
+    setTimeout(function() {
+        autoCleanOldMessages();      // 90天自动清理
+        performPerformanceCheck();   // 性能自检测
+    }, 3000);
+    
+    // 每30分钟检查一次性能
+    setInterval(function() {
+        performPerformanceCheck();
+    }, 30 * 60 * 1000);
+    
+    // 每小时检查一次90天清理
+    setInterval(function() {
+        autoCleanOldMessages();
+    }, 60 * 60 * 1000);
+    
+        // ===== 启动日记计时器 =====
+    startDiaryTimers();
     
     // ===== 页面关闭时暂停日记计时器 =====
     window.addEventListener("beforeunload", function() {
